@@ -2395,6 +2395,7 @@ static rmw_subscription_t * create_subscription(
   memcpy(const_cast<char *>(rmw_subscription->topic_name), topic_name, strlen(topic_name) + 1);
   rmw_subscription->options = *subscription_options;
   rmw_subscription->can_loan_messages = false;
+  rmw_subscription->is_cft_supported = false;
 
   cleanup_subscription.cancel();
   cleanup_rmw_subscription.cancel();
@@ -2517,6 +2518,32 @@ extern "C" rmw_ret_t rmw_subscription_get_actual_qos(
     return RMW_RET_OK;
   }
   return RMW_RET_ERROR;
+}
+
+extern "C" rmw_ret_t rmw_subscription_set_cft_expression_parameters(
+  rmw_subscription_t * subscription,
+  const char * filter_expression,
+  const rcutils_string_array_t * expression_parameters)
+{
+  static_cast<void>(subscription);
+  static_cast<void>(filter_expression);
+  static_cast<void>(expression_parameters);
+
+  RMW_SET_ERROR_MSG("rmw_subscription_set_cft_expression_parameters: unimplemented");
+  return RMW_RET_UNSUPPORTED;
+}
+
+extern "C" rmw_ret_t rmw_subscription_get_cft_expression_parameters(
+  const rmw_subscription_t * subscription,
+  char ** filter_expression,
+  rcutils_string_array_t * expression_parameters)
+{
+  static_cast<void>(subscription);
+  static_cast<void>(filter_expression);
+  static_cast<void>(expression_parameters);
+
+  RMW_SET_ERROR_MSG("rmw_subscription_get_cft_expression_parameters: unimplemented");
+  return RMW_RET_UNSUPPORTED;
 }
 
 static rmw_ret_t destroy_subscription(rmw_subscription_t * subscription)
