@@ -45,6 +45,7 @@
 #include "rmw/get_node_info_and_types.h"
 #include "rmw/get_service_names_and_types.h"
 #include "rmw/get_topic_names_and_types.h"
+#include "rmw/event_callback_type.h"
 #include "rmw/names_and_types.h"
 #include "rmw/rmw.h"
 #include "rmw/sanity_checks.h"
@@ -334,17 +335,30 @@ struct CddsNode
 {
 };
 
+struct user_callback_data_t
+{
+  std::mutex mutex;
+  rmw_event_callback_t callback {nullptr};
+  const void * user_data {nullptr};
+  size_t unread_count {0};
+  rmw_event_callback_t event_callback[DDS_STATUS_ID_MAX + 1] {nullptr};
+  const void * event_data[DDS_STATUS_ID_MAX + 1] {nullptr};
+  size_t event_unread_count[DDS_STATUS_ID_MAX + 1] {0};
+};
+
 struct CddsPublisher : CddsEntity
 {
   dds_instance_handle_t pubiid;
   rmw_gid_t gid;
   struct ddsi_sertype * sertype;
+  user_callback_data_t user_callback_data;
 };
 
 struct CddsSubscription : CddsEntity
 {
   rmw_gid_t gid;
   dds_entity_t rdcondh;
+  user_callback_data_t user_callback_data;
 };
 
 struct client_service_id_t
@@ -370,11 +384,13 @@ struct CddsClient
   dds_time_t lastcheck;
   std::map<int64_t, dds_time_t> reqtime;
 #endif
+  user_callback_data_t user_callback_data;
 };
 
 struct CddsService
 {
   CddsCS service;
+  user_callback_data_t user_callback_data;
 };
 
 struct CddsGuardCondition
@@ -446,6 +462,230 @@ extern "C" rmw_ret_t rmw_set_log_severity(rmw_log_severity_t severity)
       mask |= DDS_LC_FATAL;
   }
   dds_set_log_mask(mask);
+  return RMW_RET_OK;
+}
+
+static void dds_listener_callback(dds_entity_t entity, void * arg)
+{
+  // Not currently used
+  (void)entity;
+
+  auto data = static_cast<user_callback_data_t *>(arg);
+
+  std::lock_guard<std::mutex> guard(data->mutex);
+
+  if (data->callback) {
+    data->callback(data->user_data, 1);
+  } else {
+    data->unread_count++;
+  }
+}
+
+#define MAKE_DDS_EVENT_CALLBACK_FN(event_type, EVENT_TYPE) \
+  static void on_ ## event_type ## _fn( \
+    dds_entity_t entity, \
+    const dds_ ## event_type ## _status_t status, \
+    void * arg) \
+  { \
+    (void)status; \
+    (void)entity; \
+    auto data = static_cast<user_callback_data_t *>(arg); \
+    std::lock_guard<std::mutex> guard(data->mutex); \
+    if (data->event_callback[DDS_ ## EVENT_TYPE ## _STATUS_ID]) { \
+      data->callback(data->event_data[DDS_ ## EVENT_TYPE ## _STATUS_ID], 1); \
+    } else { \
+      data->event_unread_count[DDS_ ## EVENT_TYPE ## _STATUS_ID]++; \
+    } \
+  }
+
+// Define event callback functions
+MAKE_DDS_EVENT_CALLBACK_FN(requested_deadline_missed, REQUESTED_DEADLINE_MISSED)
+MAKE_DDS_EVENT_CALLBACK_FN(liveliness_lost, LIVELINESS_LOST)
+MAKE_DDS_EVENT_CALLBACK_FN(offered_deadline_missed, OFFERED_DEADLINE_MISSED)
+MAKE_DDS_EVENT_CALLBACK_FN(requested_incompatible_qos, REQUESTED_INCOMPATIBLE_QOS)
+MAKE_DDS_EVENT_CALLBACK_FN(sample_lost, SAMPLE_LOST)
+MAKE_DDS_EVENT_CALLBACK_FN(offered_incompatible_qos, OFFERED_INCOMPATIBLE_QOS)
+MAKE_DDS_EVENT_CALLBACK_FN(liveliness_changed, LIVELINESS_CHANGED)
+
+static void listener_set_event_callbacks(dds_listener_t * l)
+{
+  dds_lset_requested_deadline_missed(l, on_requested_deadline_missed_fn);
+  dds_lset_requested_incompatible_qos(l, on_requested_incompatible_qos_fn);
+  dds_lset_sample_lost(l, on_sample_lost_fn);
+  dds_lset_liveliness_lost(l, on_liveliness_lost_fn);
+  dds_lset_offered_deadline_missed(l, on_offered_deadline_missed_fn);
+  dds_lset_offered_incompatible_qos(l, on_offered_incompatible_qos_fn);
+  dds_lset_liveliness_changed(l, on_liveliness_changed_fn);
+}
+
+extern "C" rmw_ret_t rmw_subscription_set_on_new_message_callback(
+  rmw_subscription_t * rmw_subscription,
+  rmw_event_callback_t callback,
+  const void * user_data)
+{
+  auto sub = static_cast<CddsSubscription *>(rmw_subscription->data);
+
+  user_callback_data_t * data = &(sub->user_callback_data);
+
+  std::lock_guard<std::mutex> guard(data->mutex);
+
+  // Set the user callback data
+  data->callback = callback;
+  data->user_data = user_data;
+
+  if (callback && data->unread_count) {
+    // Push events happened before having assigned a callback
+    callback(user_data, data->unread_count);
+    data->unread_count = 0;
+  }
+
+  return RMW_RET_OK;
+}
+
+extern "C" rmw_ret_t rmw_service_set_on_new_request_callback(
+  rmw_service_t * rmw_service,
+  rmw_event_callback_t callback,
+  const void * user_data)
+{
+  auto srv = static_cast<CddsService *>(rmw_service->data);
+
+  user_callback_data_t * data = &(srv->user_callback_data);
+
+  std::lock_guard<std::mutex> guard(data->mutex);
+
+  // Set the user callback data
+  data->callback = callback;
+  data->user_data = user_data;
+
+  if (callback && data->unread_count) {
+    // Push events happened before having assigned a callback
+    callback(user_data, data->unread_count);
+    data->unread_count = 0;
+  }
+
+  return RMW_RET_OK;
+}
+
+extern "C" rmw_ret_t rmw_client_set_on_new_response_callback(
+  rmw_client_t * rmw_client,
+  rmw_event_callback_t callback,
+  const void * user_data)
+{
+  auto cli = static_cast<CddsClient *>(rmw_client->data);
+
+  user_callback_data_t * data = &(cli->user_callback_data);
+
+  std::lock_guard<std::mutex> guard(data->mutex);
+
+  // Set the user callback data
+  data->callback = callback;
+  data->user_data = user_data;
+
+  if (callback && data->unread_count) {
+    // Push events happened before having assigned a callback
+    callback(user_data, data->unread_count);
+    data->unread_count = 0;
+  }
+
+  return RMW_RET_OK;
+}
+
+template<typename T>
+static void event_set_callback(
+  T event,
+  dds_status_id_t status_id,
+  rmw_event_callback_t callback,
+  const void * user_data)
+{
+  user_callback_data_t * data = &(event->user_callback_data);
+
+  std::lock_guard<std::mutex> guard(data->mutex);
+
+  // Set the user callback data
+  data->event_callback[status_id] = callback;
+  data->event_data[status_id] = user_data;
+
+  if (callback && data->event_unread_count[status_id]) {
+    // Push events happened before having assigned a callback
+    callback(user_data, data->event_unread_count[status_id]);
+    data->event_unread_count[status_id] = 0;
+  }
+}
+
+extern "C" rmw_ret_t rmw_event_set_callback(
+  rmw_event_t * rmw_event,
+  rmw_event_callback_t callback,
+  const void * user_data)
+{
+  switch (rmw_event->event_type) {
+    case RMW_EVENT_LIVELINESS_CHANGED:
+      {
+        auto sub_event = static_cast<CddsSubscription *>(rmw_event->data);
+        event_set_callback(
+          sub_event, DDS_LIVELINESS_CHANGED_STATUS_ID,
+          callback, user_data);
+        break;
+      }
+
+    case RMW_EVENT_REQUESTED_DEADLINE_MISSED:
+      {
+        auto sub_event = static_cast<CddsSubscription *>(rmw_event->data);
+        event_set_callback(
+          sub_event, DDS_REQUESTED_DEADLINE_MISSED_STATUS_ID,
+          callback, user_data);
+        break;
+      }
+
+    case RMW_EVENT_REQUESTED_QOS_INCOMPATIBLE:
+      {
+        auto sub_event = static_cast<CddsSubscription *>(rmw_event->data);
+        event_set_callback(
+          sub_event, DDS_REQUESTED_INCOMPATIBLE_QOS_STATUS_ID,
+          callback, user_data);
+        break;
+      }
+
+    case RMW_EVENT_MESSAGE_LOST:
+      {
+        auto sub_event = static_cast<CddsSubscription *>(rmw_event->data);
+        event_set_callback(
+          sub_event, DDS_SAMPLE_LOST_STATUS_ID,
+          callback, user_data);
+        break;
+      }
+
+    case RMW_EVENT_LIVELINESS_LOST:
+      {
+        auto pub_event = static_cast<CddsPublisher *>(rmw_event->data);
+        event_set_callback(
+          pub_event, DDS_LIVELINESS_LOST_STATUS_ID,
+          callback, user_data);
+        break;
+      }
+
+    case RMW_EVENT_OFFERED_DEADLINE_MISSED:
+      {
+        auto pub_event = static_cast<CddsPublisher *>(rmw_event->data);
+        event_set_callback(
+          pub_event, DDS_OFFERED_DEADLINE_MISSED_STATUS_ID,
+          callback, user_data);
+        break;
+      }
+
+    case RMW_EVENT_OFFERED_QOS_INCOMPATIBLE:
+      {
+        auto pub_event = static_cast<CddsPublisher *>(rmw_event->data);
+        event_set_callback(
+          pub_event, DDS_OFFERED_INCOMPATIBLE_QOS_STATUS_ID,
+          callback, user_data);
+        break;
+      }
+
+    case RMW_EVENT_INVALID:
+      {
+        return RMW_RET_INVALID_ARGUMENT;
+      }
+  }
   return RMW_RET_OK;
 }
 
@@ -1919,6 +2159,11 @@ static CddsPublisher * create_cdds_publisher(
     rmw_cyclonedds_cpp::make_message_value_type(type_supports));
   struct ddsi_sertype * stact;
   topic = create_topic(dds_ppant, fqtopic_name.c_str(), sertype, &stact);
+
+  dds_listener_t * listener = dds_create_listener(&pub->user_callback_data);
+  // Set the corresponding callbacks to listen for events
+  listener_set_event_callbacks(listener);
+
   if (topic < 0) {
     RMW_SET_ERROR_MSG("failed to create topic");
     goto fail_topic;
@@ -1926,7 +2171,7 @@ static CddsPublisher * create_cdds_publisher(
   if ((qos = create_readwrite_qos(qos_policies, false)) == nullptr) {
     goto fail_qos;
   }
-  if ((pub->enth = dds_create_writer(dds_pub, topic, qos, nullptr)) < 0) {
+  if ((pub->enth = dds_create_writer(dds_pub, topic, qos, listener)) < 0) {
     RMW_SET_ERROR_MSG("failed to create writer");
     goto fail_writer;
   }
@@ -1936,6 +2181,7 @@ static CddsPublisher * create_cdds_publisher(
   }
   get_entity_gid(pub->enth, pub->gid);
   pub->sertype = stact;
+  dds_delete_listener(listener);
   dds_delete_qos(qos);
   dds_delete(topic);
   return pub;
@@ -2300,6 +2546,13 @@ static CddsSubscription * create_cdds_subscription(
     create_message_type_support(type_support->data, type_support->typesupport_identifier), false,
     rmw_cyclonedds_cpp::make_message_value_type(type_supports));
   topic = create_topic(dds_ppant, fqtopic_name.c_str(), sertype);
+
+  dds_listener_t * listener = dds_create_listener(&sub->user_callback_data);
+  // Set the callback to listen for new messages
+  dds_lset_data_available(listener, dds_listener_callback);
+  // Set the corresponding callbacks to listen for events
+  listener_set_event_callbacks(listener);
+
   if (topic < 0) {
     RMW_SET_ERROR_MSG("failed to create topic");
     goto fail_topic;
@@ -2307,7 +2560,7 @@ static CddsSubscription * create_cdds_subscription(
   if ((qos = create_readwrite_qos(qos_policies, ignore_local_publications)) == nullptr) {
     goto fail_qos;
   }
-  if ((sub->enth = dds_create_reader(dds_sub, topic, qos, nullptr)) < 0) {
+  if ((sub->enth = dds_create_reader(dds_sub, topic, qos, listener)) < 0) {
     RMW_SET_ERROR_MSG("failed to create reader");
     goto fail_reader;
   }
@@ -2316,6 +2569,7 @@ static CddsSubscription * create_cdds_subscription(
     RMW_SET_ERROR_MSG("failed to create readcondition");
     goto fail_readcond;
   }
+  dds_delete_listener(listener);
   dds_delete_qos(qos);
   dds_delete(topic);
   return sub;
@@ -3842,7 +4096,8 @@ static void get_unique_csid(const rmw_node_t * node, client_service_id_t & id)
 }
 
 static rmw_ret_t rmw_init_cs(
-  CddsCS * cs, const rmw_node_t * node,
+  CddsCS * cs, user_callback_data_t * cb_data,
+  const rmw_node_t * node,
   const rosidl_service_type_support_t * type_supports,
   const char * service_name, const rmw_qos_profile_t * qos_policies,
   bool is_service)
@@ -3882,6 +4137,9 @@ static rmw_ret_t rmw_init_cs(
   void * pub_type_support, * sub_type_support;
 
   std::unique_ptr<rmw_cyclonedds_cpp::StructValueType> pub_msg_ts, sub_msg_ts;
+
+  dds_listener_t * listener = dds_create_listener(cb_data);
+  dds_lset_data_available(listener, dds_listener_callback);
 
   if (is_service) {
     std::tie(sub_msg_ts, pub_msg_ts) =
@@ -3960,7 +4218,7 @@ static rmw_ret_t rmw_init_cs(
   }
   get_entity_gid(pub->enth, pub->gid);
   pub->sertype = pub_stact;
-  if ((sub->enth = dds_create_reader(node->context->impl->dds_sub, subtopic, qos, nullptr)) < 0) {
+  if ((sub->enth = dds_create_reader(node->context->impl->dds_sub, subtopic, qos, listener)) < 0) {
     RMW_SET_ERROR_MSG("failed to create reader");
     goto fail_reader;
   }
@@ -3973,6 +4231,7 @@ static rmw_ret_t rmw_init_cs(
     RMW_SET_ERROR_MSG("failed to get instance handle for writer");
     goto fail_instance_handle;
   }
+  dds_delete_listener(listener);
   dds_delete_qos(qos);
   dds_delete(subtopic);
   dds_delete(pubtopic);
@@ -4060,7 +4319,8 @@ extern "C" rmw_client_t * rmw_create_client(
 #endif
   if (
     rmw_init_cs(
-      &info->client, node, type_supports, service_name, qos_policies, false) != RMW_RET_OK)
+      &info->client, &info->user_callback_data,
+      node, type_supports, service_name, qos_policies, false) != RMW_RET_OK)
   {
     delete (info);
     return nullptr;
@@ -4161,7 +4421,8 @@ extern "C" rmw_service_t * rmw_create_service(
   CddsService * info = new CddsService();
   if (
     rmw_init_cs(
-      &info->service, node, type_supports, service_name, qos_policies, true) != RMW_RET_OK)
+      &info->service, &info->user_callback_data,
+      node, type_supports, service_name, qos_policies, true) != RMW_RET_OK)
   {
     delete (info);
     return nullptr;
